@@ -5,6 +5,7 @@ import os
 import json
 from datetime import datetime
 import logging
+import io
 
 # ページ設定
 st.set_page_config(
@@ -59,6 +60,14 @@ st.markdown("""
         margin: 1rem 0;
         text-align: center;
     }
+    .error-banner {
+        background: linear-gradient(90deg, #dc3545 0%, #fd7e14 100%);
+        color: white;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+        text-align: center;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -81,8 +90,17 @@ def format_time(seconds):
     seconds = int(seconds % 60)
     return f"{minutes:02d}:{seconds:02d}"
 
+def safe_file_extension(filename):
+    """安全なファイル拡張子を取得"""
+    if not filename:
+        return ".wav"
+    ext = os.path.splitext(filename)[1].lower()
+    # Whisperが直接サポートする形式
+    supported_exts = ['.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac']
+    return ext if ext in supported_exts else ".wav"
+
 def transcribe_audio(audio_file, model_size, language, enable_timestamps, is_recording=False):
-    """音声ファイルを文字起こし"""
+    """音声ファイルを文字起こし（FFmpeg不要版）"""
     
     # プログレスバー表示
     progress_bar = st.progress(0)
@@ -95,28 +113,43 @@ def transcribe_audio(audio_file, model_size, language, enable_timestamps, is_rec
         
         model = load_whisper_model(model_size)
         if model is None:
-            st.error("❌ Whisperモデルの読み込みに失敗しました")
-            return None
+            st.markdown("""
+            <div class="error-banner">
+                ❌ Whisperモデルの読み込みに失敗しました
+            </div>
+            """, unsafe_allow_html=True)
+            return None, None
         
-        # Step 2: 一時ファイル作成
+        # Step 2: 一時ファイル作成（FFmpeg不要）
         status_text.text("📁 音声ファイル準備中...")
         progress_bar.progress(40)
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-            if is_recording:
-                tmp_file.write(audio_file.getvalue())
-            else:
-                tmp_file.write(audio_file.getvalue())
-            tmp_file_path = tmp_file.name
+        # 適切な拡張子を決定
+        if is_recording:
+            file_extension = ".wav"
+        else:
+            file_extension = safe_file_extension(audio_file.name)
+        
+        # 一時ファイルに直接保存（変換なし）
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
+            try:
+                # ファイル内容を直接書き込み
+                file_content = audio_file.getvalue() if hasattr(audio_file, 'getvalue') else audio_file.read()
+                tmp_file.write(file_content)
+                tmp_file_path = tmp_file.name
+            except Exception as e:
+                st.error(f"ファイル書き込みエラー: {e}")
+                return None, None
         
         # Step 3: 文字起こし設定
         status_text.text("⚙️ AI解析設定中...")
         progress_bar.progress(60)
         
-        # Whisperオプション設定
+        # Whisperオプション設定（FFmpegに依存しない設定）
         options = {
             "language": None if language == "auto" else language,
             "verbose": False,
+            "fp16": False,  # CPUでの安定性向上
         }
         
         if enable_timestamps:
@@ -127,21 +160,40 @@ def transcribe_audio(audio_file, model_size, language, enable_timestamps, is_rec
         progress_bar.progress(80)
         
         start_time = datetime.now()
-        result = model.transcribe(tmp_file_path, **options)
+        
+        # Whisperで直接処理（FFmpeg不要）
+        try:
+            result = model.transcribe(tmp_file_path, **options)
+        except Exception as whisper_error:
+            # Whisperエラーの詳細処理
+            st.markdown(f"""
+            <div class="error-banner">
+                ❌ 音声解析エラー: {str(whisper_error)}<br>
+                💡 ファイル形式を変更するか、より小さなファイルを試してください
+            </div>
+            """, unsafe_allow_html=True)
+            return None, None
+        
         processing_time = (datetime.now() - start_time).total_seconds()
         
         # Step 5: 結果整理
         status_text.text("📝 結果を整理中...")
         progress_bar.progress(100)
         
+        # テキストの基本チェック
+        transcribed_text = result.get("text", "").strip()
+        if not transcribed_text:
+            st.warning("⚠️ 音声から文字を検出できませんでした。音声がクリアか、ファイルが破損していないか確認してください。")
+            return None, None
+        
         # 結果データ作成
         transcription_result = {
-            "text": result["text"].strip(),
+            "text": transcribed_text,
             "language": result.get("language", "unknown"),
             "processing_time": processing_time,
             "model_used": model_size,
-            "char_count": len(result["text"].strip()),
-            "word_count": len(result["text"].strip().split()),
+            "char_count": len(transcribed_text),
+            "word_count": len(transcribed_text.split()),
             "timestamp": datetime.now().isoformat(),
             "confidence": 1.0 - result.get("no_speech_prob", 0.0)
         }
@@ -173,7 +225,30 @@ def transcribe_audio(audio_file, model_size, language, enable_timestamps, is_rec
     except Exception as e:
         progress_bar.empty()
         status_text.empty()
-        st.error(f"❌ 文字起こしエラー: {str(e)}")
+        
+        # エラーの種類に応じた対処法を表示
+        error_message = str(e)
+        if "ffmpeg" in error_message.lower():
+            st.markdown("""
+            <div class="error-banner">
+                ❌ ファイル変換エラーが発生しました<br>
+                💡 対処法: MP3、WAV、M4A形式のファイルを直接使用してください
+            </div>
+            """, unsafe_allow_html=True)
+        elif "memory" in error_message.lower():
+            st.markdown("""
+            <div class="error-banner">
+                ❌ メモリ不足エラー<br>
+                💡 対処法: より小さなファイルを使用するか、「tiny」モデルを選択してください
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="error-banner">
+                ❌ 処理エラー: {error_message}<br>
+                💡 ファイル形式やサイズを確認してください
+            </div>
+            """, unsafe_allow_html=True)
         
         # 一時ファイル削除（エラー時）
         try:
@@ -366,6 +441,16 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
+    # 重要な注意事項
+    st.markdown("""
+    <div class="feature-card">
+        <h4>📋 推奨ファイル形式</h4>
+        <p><strong>最適:</strong> WAV, MP3, M4A形式</p>
+        <p><strong>ファイルサイズ:</strong> 25MB以下</p>
+        <p><strong>音声品質:</strong> クリアな録音がおすすめ</p>
+    </div>
+    """, unsafe_allow_html=True)
+
     # サイドバー設定
     with st.sidebar:
         st.markdown("## ⚙️ 設定パネル")
@@ -373,14 +458,13 @@ def main():
         st.markdown("### 🤖 AIモデル選択")
         model_size = st.selectbox(
             "処理速度と精度のバランス",
-            options=["tiny", "base", "small", "medium", "large"],
+            options=["tiny", "base", "small", "medium"],  # largeを除外（メモリ対策）
             index=1,  # baseをデフォルト
             help="""
             🚀 tiny: 最高速・基本精度 (39MB)
             ⚡ base: バランス型・推奨 (74MB)
             🎯 small: 高精度・中速 (244MB)
             🏆 medium: より高精度・低速 (769MB)
-            👑 large: 最高精度・最低速 (1550MB)
             """
         )
         
@@ -420,8 +504,9 @@ def main():
         ✅ **詳細レポート生成**  
         
         ### 📱 対応ファイル
-        **音声**: MP3, WAV, M4A, FLAC, OGG, AAC  
-        **動画**: MP4, AVI, MOV, MKV, WebM
+        **推奨**: WAV, MP3, M4A  
+        **対応**: FLAC, OGG, AAC  
+        **動画**: MP4, AVI, MOV (音声抽出)
         """)
 
     # メインコンテンツエリア
@@ -431,36 +516,49 @@ def main():
         st.markdown("## 📁 ファイルアップロード")
         
         uploaded_file = st.file_uploader(
-            "音声・動画ファイルを選択",
-            type=['mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac', 'mp4', 'avi', 'mov', 'mkv', 'webm'],
-            help="ドラッグ&ドロップまたはクリックしてファイルを選択"
+            "音声ファイルを選択",
+            type=['wav', 'mp3', 'm4a', 'flac', 'ogg', 'aac'],  # 確実に動作する形式のみ
+            help="WAV, MP3, M4A形式を推奨します"
         )
         
         if uploaded_file is not None:
             # ファイル情報を美しく表示
             file_size = len(uploaded_file.getvalue()) / (1024 * 1024)
             
-            st.markdown(f"""
-            <div class="feature-card">
-                <h4>📄 選択されたファイル</h4>
-                <p><strong>ファイル名:</strong> {uploaded_file.name}</p>
-                <p><strong>サイズ:</strong> {file_size:.1f}MB</p>
-                <p><strong>タイプ:</strong> {uploaded_file.type}</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # 音声プレビュー（音声ファイルの場合）
-            if uploaded_file.type.startswith('audio/'):
-                st.audio(uploaded_file.getvalue())
+            # ファイルサイズチェック
+            if file_size > 25:
+                st.markdown("""
+                <div class="error-banner">
+                    ⚠️ ファイルサイズが25MBを超えています<br>
+                    💡 より小さなファイルを使用してください
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="feature-card">
+                    <h4>📄 選択されたファイル</h4>
+                    <p><strong>ファイル名:</strong> {uploaded_file.name}</p>
+                    <p><strong>サイズ:</strong> {file_size:.1f}MB</p>
+                    <p><strong>タイプ:</strong> {uploaded_file.type}</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # 音声プレビュー
+                if uploaded_file.type.startswith('audio/'):
+                    st.audio(uploaded_file.getvalue())
         
         # 文字起こし実行ボタン
         if st.button("🚀 文字起こし開始", type="primary", use_container_width=True):
             if uploaded_file is not None:
-                result, segments = transcribe_audio(uploaded_file, model_size, language, enable_timestamps)
-                if result:
-                    st.session_state['result'] = result
-                    st.session_state['segments'] = segments
-                    st.experimental_rerun()
+                file_size = len(uploaded_file.getvalue()) / (1024 * 1024)
+                if file_size <= 25:
+                    result, segments = transcribe_audio(uploaded_file, model_size, language, enable_timestamps)
+                    if result:
+                        st.session_state['result'] = result
+                        st.session_state['segments'] = segments
+                        st.experimental_rerun()
+                else:
+                    st.error("❌ ファイルサイズが25MBを超えています")
             else:
                 st.error("❌ 音声ファイルを選択してください")
 
@@ -499,7 +597,7 @@ def main():
         <div class="result-box">
             <div style="text-align: center; color: #999; padding: 2rem;">
                 <h3>🎯 音声文字起こしを開始してください</h3>
-                <p>📁 ファイルをアップロードするか、🎤 マイクで録音して文字起こしボタンを押してください</p>
+                <p>📁 音声ファイルをアップロードするか、🎤 マイクで録音して文字起こしボタンを押してください</p>
                 <br>
                 <p><strong>✨ このツールでできること:</strong></p>
                 <p>📝 高精度な音声認識 | ⏰ 時間区切り表示 | 🌍 多言語対応 | 💾 結果ダウンロード</p>
