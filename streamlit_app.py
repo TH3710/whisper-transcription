@@ -556,7 +556,7 @@ def main():
                     if result:
                         st.session_state['result'] = result
                         st.session_state['segments'] = segments
-                        st.experimental_rerun()
+                        st.rerun()
                 else:
                     st.error("❌ ファイルサイズが25MBを超えています")
             else:
@@ -583,7 +583,7 @@ def main():
                 if result:
                     st.session_state['result'] = result
                     st.session_state['segments'] = segments
-                    st.experimental_rerun()
+                    st.rerun()
 
     # 結果表示エリア
     st.markdown("---")
